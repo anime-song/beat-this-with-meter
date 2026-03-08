@@ -15,7 +15,7 @@ from beat_this.dataset.augment import (
     augment_pitchtempo,
     precomputed_augmentation_filenames,
 )
-from beat_this.utils import index_to_framewise
+from beat_this.utils import index_to_framewise, resolve_annotation_paths
 
 from .mmnpz import MemmappedNpzFile
 
@@ -44,6 +44,9 @@ class BeatTrackingDataset(Dataset):
         deterministic=False,
         augmentations={},
         length_based_oversampling_factor=0,
+        meter_to_idx=None,
+        num_to_idx=None,
+        den_to_idx=None,
     ):
         self.spect_basepath = data_folder / "audio" / "spectrograms"
         self.annotation_basepath = data_folder / "annotations"
@@ -52,6 +55,11 @@ class BeatTrackingDataset(Dataset):
         self.deterministic = deterministic
         self.augmentations = augmentations
         self.length_based_oversampling_factor = length_based_oversampling_factor
+        
+        self.meter_to_idx = meter_to_idx
+        self.num_to_idx = num_to_idx
+        self.den_to_idx = den_to_idx
+        
         datasets = sorted(set(name.split("/", 1)[0] for name in item_names))
         # load dataset info
         self.dataset_info = self._load_dataset_infos(datasets)
@@ -107,24 +115,58 @@ class BeatTrackingDataset(Dataset):
 
         # load beat and produce a default if beat values are not found
         dataset, stem = item_name.split("/", 1)
-        annotation_path = (
+        annotation_base = (
             self.annotation_basepath
             / dataset
             / "annotations"
             / "beats"
-            / (stem + ".beats")
         )
-        beat_annotation = np.loadtxt(annotation_path)
-        if beat_annotation.ndim == 2:
-            beat_time = beat_annotation[:, 0]
-            beat_value = beat_annotation[:, 1].astype(int)
+        
+        txt_path, json_path = resolve_annotation_paths(annotation_base, stem)
+
+        time_sig_num = None
+        time_sig_den = None
+        beat_annotation = None
+
+        if json_path is not None:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            measures = data.get("measures", [])
+            
+            beat_times = []
+            nums = []
+            dens = []
+            
+            for m in measures:
+                beat_times.append(m["downbeat_sec"])
+                nums.append(m["time_sig_num"])
+                dens.append(m["time_sig_den"])
+                
+            beat_time = np.array(beat_times, dtype=float)
+            # all downbeats
+            beat_value = np.ones_like(beat_time, dtype=np.int32)
+            time_sig_num = np.array(nums, dtype=np.int32)
+            time_sig_den = np.array(dens, dtype=np.int32)
+            
+            # Since this dataset only has downbeats, we set a flag to mask out normal beats loss
+            has_only_downbeats = True
+             
+        elif txt_path is not None:
+            beat_annotation = np.loadtxt(txt_path)
+            if beat_annotation.ndim == 2:
+                beat_time = beat_annotation[:, 0]
+                beat_value = beat_annotation[:, 1].astype(int)
+            else:
+                beat_time = beat_annotation
+                beat_value = np.zeros_like(beat_time, dtype=np.int32)
+            has_only_downbeats = False
         else:
-            beat_time = beat_annotation
-            beat_value = np.zeros_like(beat_time, dtype=np.int32)
+            print(f"Skipping {item_name} because no annotation file was found.")
+            return
 
         # stop if the annotations that are supposed to be there are not there
         if self.dataset_info[dataset]["has_downbeats"]:
-            if beat_annotation.ndim != 2:
+            if json_path is None and beat_annotation is not None and beat_annotation.ndim != 2:
                 print(
                     f"Skipping {item_name} because it has {beat_annotation.ndim} columns but downbeat is supposed to be there."
                 )
@@ -135,11 +177,15 @@ class BeatTrackingDataset(Dataset):
         # take care of different subsections of rwc for the dataset name
         if dataset == "rwc":
             dataset = "rwc_" + stem.split("_", 2)[1]
+            
         return {
             "spect_path": Path(item_name) / "track.npy",
             "beat_time": beat_time,
             "beat_value": beat_value,
             "downbeat_mask": downbeat_mask,
+            "has_only_downbeats": has_only_downbeats,
+            "time_sig_num": time_sig_num,
+            "time_sig_den": time_sig_den,
             "dataset": dataset,
         }
 
@@ -210,10 +256,13 @@ class BeatTrackingDataset(Dataset):
                 framewise_truth_downbeat,
                 truth_orig_beat,
                 truth_orig_downbeat,
+                framewise_time_sig_num,
+                framewise_time_sig_den,
+                has_only_downbeats,
             ) = prepare_annotations(item, start_frame, end_frame, self.fps)
 
             # restructure the item dict with the correct training information
-            item = {
+            out_item = {
                 "spect": spect,
                 "spect_path": str(item["spect_path"]),
                 "dataset": item["dataset"],
@@ -228,17 +277,53 @@ class BeatTrackingDataset(Dataset):
                 ),
                 "truth_orig_beat": truth_orig_beat,
                 "truth_orig_downbeat": truth_orig_downbeat,
+                "has_only_downbeats": torch.as_tensor(has_only_downbeats),
             }
+            if framewise_time_sig_num is not None:
+                # convert native values to class indices if vocab dictionaries are provided
+                if self.num_to_idx is not None:
+                    mapped_num = np.zeros_like(framewise_time_sig_num) - 1
+                    for val, idx in self.num_to_idx.items():
+                        mapped_num[framewise_time_sig_num == val] = idx
+                    out_item["time_sig_num"] = mapped_num
+                else:
+                    out_item["time_sig_num"] = framewise_time_sig_num
+                    
+                if self.den_to_idx is not None:
+                    mapped_den = np.zeros_like(framewise_time_sig_den) - 1
+                    for val, idx in self.den_to_idx.items():
+                        mapped_den[framewise_time_sig_den == val] = idx
+                    out_item["time_sig_den"] = mapped_den
+                else:
+                    out_item["time_sig_den"] = framewise_time_sig_den
+                    
+                if self.meter_to_idx is not None:
+                    # Create meter sequence from num and den
+                    # we only iterate over non-ignore (-1) elements
+                    meter_seq = np.zeros_like(framewise_time_sig_num) - 1
+                    valid_mask = framewise_time_sig_num != -1
+                    for i in np.where(valid_mask)[0]:
+                        meter_str = f"{framewise_time_sig_num[i]}/{framewise_time_sig_den[i]}"
+                        if meter_str in self.meter_to_idx:
+                            meter_seq[i] = self.meter_to_idx[meter_str]
+                    out_item["time_sig_meter"] = meter_seq
 
             # pad all framewise tensors if needed
             if longer < 0:
-                item["spect"] = np.pad(
-                    item["spect"], [(0, -longer), (0, 0)], constant_values=0
+                out_item["spect"] = np.pad(
+                    out_item["spect"], [(0, -longer), (0, 0)], constant_values=0
                 )
                 for k in "truth_beat", "truth_downbeat":
-                    item[k] = np.pad(item[k], [(0, -longer)], constant_values=0)
-                item["padding_mask"][longer:] = 0
-            return item
+                    out_item[k] = np.pad(out_item[k], [(0, -longer)], constant_values=0)
+                out_item["padding_mask"][longer:] = 0
+                if framewise_time_sig_num is not None:
+                    # use -1 as ignore label index for padding
+                    out_item["time_sig_num"] = np.pad(out_item["time_sig_num"], [(0, -longer)], constant_values=-1)
+                    out_item["time_sig_den"] = np.pad(out_item["time_sig_den"], [(0, -longer)], constant_values=-1)
+                    if self.meter_to_idx is not None:
+                        out_item["time_sig_meter"] = np.pad(out_item["time_sig_meter"], [(0, -longer)], constant_values=-1)
+                    
+            return out_item
 
         else:  # when index is a list of ints
             return [self[i] for i in index]
@@ -517,13 +602,15 @@ def prepare_annotations(item, start_frame, end_frame, fps):
     # form annotations excerpt
     # filter out the annotations that are earlier than the start and shift left
     truth_bdb_frame -= start_frame
-    idx = np.searchsorted(truth_bdb_frame, 0)
-    truth_bdb_frame = truth_bdb_frame[idx:]
-    truth_bdb_value = truth_bdb_value[idx:]
+    idx_start = np.searchsorted(truth_bdb_frame, 0)
+    truth_bdb_frame = truth_bdb_frame[idx_start:]
+    truth_bdb_value = truth_bdb_value[idx_start:]
+    
     # filter out the annotations that are later than the end
-    idx = np.searchsorted(truth_bdb_frame, end_frame - start_frame)
-    truth_bdb_frame = truth_bdb_frame[:idx]
-    truth_bdb_value = truth_bdb_value[:idx]
+    idx_end = np.searchsorted(truth_bdb_frame, end_frame - start_frame)
+    truth_bdb_frame = truth_bdb_frame[:idx_end]
+    truth_bdb_value = truth_bdb_value[:idx_end]
+
     # create beat and downbeat separated annotations
     truth_beat = truth_bdb_frame
     truth_downbeat = truth_bdb_frame[truth_bdb_value == 1]
@@ -532,6 +619,23 @@ def prepare_annotations(item, start_frame, end_frame, fps):
     framewise_truth_downbeat = index_to_framewise(
         truth_downbeat, end_frame - start_frame
     )
+    
+    # prepare time_sig_num and time_sig_den if they are presented
+    framewise_time_sig_num = None
+    framewise_time_sig_den = None
+    
+    if item.get("time_sig_num") is not None and item.get("time_sig_den") is not None:
+        idx_end_sig = idx_start + idx_end # recover original offset end index
+        time_sig_num_seq = item["time_sig_num"][idx_start:idx_end_sig]
+        time_sig_den_seq = item["time_sig_den"][idx_start:idx_end_sig]
+        
+        # transform to framewise annotations (similar to beat, but set categorical labels at the downbeat frames)
+        framewise_time_sig_num = np.zeros(end_frame - start_frame, dtype=np.int32) - 1 # Use -1 as ignore index
+        framewise_time_sig_num[truth_downbeat] = time_sig_num_seq
+        
+        framewise_time_sig_den = np.zeros(end_frame - start_frame, dtype=np.int32) - 1
+        framewise_time_sig_den[truth_downbeat] = time_sig_den_seq
+
     # create orig beat, downbeat annotations for unquantized evaluation
     truth_orig_beat = item["beat_time"]
     truth_orig_downbeat = truth_bdb_time[
@@ -553,4 +657,7 @@ def prepare_annotations(item, start_frame, end_frame, fps):
         framewise_truth_downbeat,
         truth_orig_beat,
         truth_orig_downbeat,
+        framewise_time_sig_num,
+        framewise_time_sig_den,
+        item.get("has_only_downbeats", False)
     )

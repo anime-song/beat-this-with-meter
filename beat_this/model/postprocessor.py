@@ -21,10 +21,15 @@ class Postprocessor:
         fps (int): the frames per second of the model framewise predictions. Default is 50.
     """
 
-    def __init__(self, type: str = "minimal", fps: int = 50):
+    def __init__(
+        self, type: str = "minimal", fps: int = 50, use_beat_guidance: bool = True
+    ):
         assert type in ["minimal", "dbn"]
+        if type == "dbn" and not use_beat_guidance:
+            raise ValueError("DBN postprocessing requires beat guidance.")
         self.type = type
         self.fps = fps
+        self.use_beat_guidance = use_beat_guidance
         if type == "dbn":
             from madmom.features.downbeats import DBNDownBeatTrackingProcessor
 
@@ -124,10 +129,8 @@ class Postprocessor:
         # convert from frame to seconds
         beat_time = beat_frame / self.fps
         downbeat_time = downbeat_frame / self.fps
-        # move the downbeat to the nearest beat
-        if (
-            len(beat_time) > 0
-        ):  # skip if there are no beats, like in the first training steps
+        # When beat supervision is disabled, keep downbeats independent from beat peaks.
+        if self.use_beat_guidance and len(beat_time) > 0:
             for i, d_time in enumerate(downbeat_time):
                 beat_idx = np.argmin(np.abs(beat_time - d_time))
                 downbeat_time[i] = beat_time[beat_idx]

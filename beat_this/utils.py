@@ -1,3 +1,4 @@
+import json
 from itertools import chain
 from pathlib import Path
 
@@ -102,6 +103,33 @@ def save_beat_tsv(beats: np.ndarray, downbeats: np.ndarray, outpath: str) -> Non
         outpath.unlink()  # avoid half-written files
 
 
+def save_events_tsv(events: np.ndarray, outpath: str) -> None:
+    """
+    Save one event time per line.
+    """
+    outpath = Path(outpath)
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(outpath, "w", encoding="utf-8") as handle:
+            handle.writelines(f"{float(event)}\n" for event in events)
+    except KeyboardInterrupt:
+        outpath.unlink(missing_ok=True)
+
+
+def save_meter_json(meter_prediction: dict, outpath: str) -> None:
+    """
+    Save decoded meter predictions as JSON.
+    """
+    outpath = Path(outpath)
+    outpath.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(outpath, "w", encoding="utf-8") as handle:
+            json.dump(meter_prediction, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+    except KeyboardInterrupt:
+        outpath.unlink(missing_ok=True)
+
+
 def replace_state_dict_key(state_dict: dict, old: str, new: str):
     """Replaces `old` in all keys of `state_dict` with `new`."""
     keys = list(state_dict.keys())  # take snapshot of the keys
@@ -109,3 +137,23 @@ def replace_state_dict_key(state_dict: dict, old: str, new: str):
         if old in key:
             state_dict[key.replace(old, new)] = state_dict.pop(key)
     return state_dict
+
+
+def resolve_annotation_paths(annotation_dir: str | Path, stem: str):
+    """
+    Resolve supported annotation file paths for a track stem.
+
+    Supports the original `*.beats` / `*.beats.json` names and the
+    `*.beat.beats.json` variant currently present in `meter_dataset`.
+    """
+    annotation_dir = Path(annotation_dir)
+
+    txt_candidates = [annotation_dir / f"{stem}.beats"]
+    json_candidates = [
+        annotation_dir / f"{stem}.beats.json",
+        annotation_dir / f"{stem}.beat.beats.json",
+    ]
+
+    txt_path = next((path for path in txt_candidates if path.exists()), None)
+    json_path = next((path for path in json_candidates if path.exists()), None)
+    return txt_path, json_path

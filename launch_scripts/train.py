@@ -7,7 +7,9 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
 from beat_this.dataset import BeatDataModule
+from beat_this.inference import load_checkpoint
 from beat_this.model.pl_module import PLBeatThis
+from beat_this.utils import replace_state_dict_key, resolve_annotation_paths
 
 
 def main(args):
@@ -17,7 +19,7 @@ def main(args):
     print("Starting a new run with the following parameters:")
     print(args)
 
-    params_str = f"{'noval ' if not args.val else ''}{'hung ' if args.hung_data else ''}{'fold' + str(args.fold) + ' ' if args.fold is not None else ''}{args.loss}-h{args.transformer_dim}-aug{args.tempo_augmentation}{args.pitch_augmentation}{args.mask_augmentation}{' nosumH ' if not args.sum_head else ''}{' nopartialT ' if not args.partial_transformers else ''}"
+    params_str = f"{'noval ' if not args.val else ''}{'hung ' if args.hung_data else ''}{'fold' + str(args.fold) + ' ' if args.fold is not None else ''}{args.loss}-h{args.transformer_dim}-aug{args.tempo_augmentation}{args.pitch_augmentation}{args.mask_augmentation}{' nosumH ' if not args.sum_head else ''}{' nopartialT ' if not args.partial_transformers else ''}{' downbeatOnly ' if args.downbeat_only else ''}"
     if args.logger == "wandb":
         if args.resume_checkpoint and args.resume_id:
             wandb_args = dict(id=args.resume_id, resume="must")
@@ -71,8 +73,81 @@ def main(args):
     )
     datamodule.setup(stage="fit")
 
+    # Meter prediction logic
+    num_classes = None
+    num_class_counts = None
+    den_classes = None
+    den_class_counts = None
+    meter_classes = None
+    meter_class_counts = None
+    num_vocab = None
+    den_vocab = None
+    meter_vocab = None
+
+    if args.meter_prediction:
+        import json
+
+        num_counts = {}
+        den_counts = {}
+        meter_counts = {}
+
+        print("Scanning training data for meter vocabulary...")
+        # read the raw jsons corresponding to the training items
+        for item in datamodule.train_dataset.items:
+            spect_path = Path(item["spect_path"])
+            dataset = spect_path.parts[0]
+            stem = spect_path.parent.name
+            annotation_base = (
+                data_dir / "annotations" / dataset / "annotations" / "beats"
+            )
+            _, json_path = resolve_annotation_paths(annotation_base, stem)
+            if json_path is not None:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                for measure in data.get("measures", []):
+                    num = measure["time_sig_num"]
+                    den = measure["time_sig_den"]
+                    meter = f"{num}/{den}"
+
+                    num_counts[num] = num_counts.get(num, 0) + 1
+                    den_counts[den] = den_counts.get(den, 0) + 1
+                    meter_counts[meter] = meter_counts.get(meter, 0) + 1
+
+        num_vocab = sorted(list(num_counts.keys()))
+        den_vocab = sorted(list(den_counts.keys()))
+        meter_vocab = sorted(list(meter_counts.keys()))
+
+        num_to_idx = {k: v for v, k in enumerate(num_vocab)}
+        den_to_idx = {k: v for v, k in enumerate(den_vocab)}
+        meter_to_idx = {k: v for v, k in enumerate(meter_vocab)}
+
+        num_classes = len(num_vocab)
+        den_classes = len(den_vocab)
+        meter_classes = len(meter_vocab)
+        num_class_counts = [num_counts[num] for num in num_vocab]
+        den_class_counts = [den_counts[den] for den in den_vocab]
+        meter_class_counts = [meter_counts[meter] for meter in meter_vocab]
+
+        # assign vocab to datasets
+        datamodule.train_dataset.num_to_idx = num_to_idx
+        datamodule.train_dataset.den_to_idx = den_to_idx
+        datamodule.train_dataset.meter_to_idx = meter_to_idx
+
+        if hasattr(datamodule, "val_dataset") and datamodule.val_dataset is not None:
+            datamodule.val_dataset.num_to_idx = num_to_idx
+            datamodule.val_dataset.den_to_idx = den_to_idx
+            datamodule.val_dataset.meter_to_idx = meter_to_idx
+
+        print(
+            f"Meter Vocabulary - num_classes: {num_classes}, den_classes: {den_classes}, meter_classes: {meter_classes}"
+        )
+
     # compute positive weights
     pos_weights = datamodule.get_train_positive_weights(widen_target_mask=3)
+    if args.beat_pos_weight is not None:
+        pos_weights["beat"] = args.beat_pos_weight
+    if args.downbeat_pos_weight is not None:
+        pos_weights["downbeat"] = args.downbeat_pos_weight
     print("Using positive weights: ", pos_weights)
     dropout = {
         "frontend": args.frontend_dropout,
@@ -97,7 +172,36 @@ def main(args):
         eval_trim_beats=args.eval_trim_beats,
         sum_head=args.sum_head,
         partial_transformers=args.partial_transformers,
+        train_beats=not args.downbeat_only,
+        num_classes=num_classes,
+        num_class_counts=num_class_counts,
+        den_classes=den_classes,
+        den_class_counts=den_class_counts,
+        meter_classes=meter_classes,
+        meter_class_counts=meter_class_counts,
+        num_vocab=num_vocab,
+        den_vocab=den_vocab,
+        meter_vocab=meter_vocab,
+        loss_weights={
+            "num": args.num_loss_weight,
+            "den": args.den_loss_weight,
+            "meter": args.meter_loss_weight,
+        },
+        freeze_backbone_epochs=args.freeze_backbone_epochs,
     )
+
+    if args.pretrained_checkpoint:
+        print(f"Loading pretrained weights from {args.pretrained_checkpoint}")
+        checkpoint = load_checkpoint(args.pretrained_checkpoint, device="cpu")
+        state_dict = checkpoint.get("state_dict", checkpoint)
+        # PLBeatThis saves model weights with "model." prefix, remove it to load into BeatThis instance
+        state_dict = replace_state_dict_key(state_dict, "model.", "")
+        try:
+            pl_model.model.load_state_dict(state_dict, strict=False)
+            print("Successfully loaded pretrained weights (strict=False).")
+        except Exception as e:
+            print(f"Error loading state_dict: {e}")
+
     for part in args.compile:
         if hasattr(pl_model.model, part):
             setattr(pl_model.model, part, torch.compile(getattr(pl_model.model, part)))
@@ -161,7 +265,7 @@ if __name__ == "__main__":
         default=0.2,
         help="dropout rate to apply in the main transformer blocks",
     )
-    parser.add_argument("--lr", type=float, default=0.0008)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--logger", type=str, choices=["wandb", "none"], default="none")
     parser.add_argument("--num-workers", type=int, default=8)
@@ -180,7 +284,7 @@ if __name__ == "__main__":
         help="The loss to use",
     )
     parser.add_argument(
-        "--warmup-steps", type=int, default=1000, help="warmup steps for optimizer"
+        "--warmup-steps", type=int, default=50, help="warmup steps for optimizer"
     )
     parser.add_argument(
         "--max-epochs", type=int, default=100, help="max epochs for training"
@@ -212,7 +316,7 @@ if __name__ == "__main__":
         "--val-frequency",
         metavar="N",
         type=int,
-        default=5,
+        default=1,
         help="validate every N epochs (default: %(default)s)",
     )
     parser.add_argument(
@@ -279,13 +383,67 @@ if __name__ == "__main__":
         "--resume-checkpoint",
         type=str,
         default=None,
-        help="Resume training from a local checkpoint."
+        help="Resume training from a local checkpoint.",
     )
     parser.add_argument(
         "--resume-id",
         type=str,
         default=None,
-        help="When resuming with --resume-checkpoint, optionally provide the wandb id to continue logging to."
+        help="When resuming with --resume-checkpoint, optionally provide the wandb id to continue logging to.",
+    )
+    parser.add_argument(
+        "--pretrained-checkpoint",
+        type=str,
+        default=None,
+        help="Path or name of a pretrained checkpoint to use as initial weights for fine-tuning.",
+    )
+    parser.add_argument(
+        "--meter-prediction",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Enable meter (time signature) prediction heads and losses.",
+    )
+    parser.add_argument(
+        "--downbeat-only",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Disable beat loss and beat metrics; train only downbeat and optional meter targets.",
+    )
+    parser.add_argument(
+        "--num-loss-weight",
+        type=float,
+        default=0.1,
+        help="Weight applied to the numerator classification loss.",
+    )
+    parser.add_argument(
+        "--den-loss-weight",
+        type=float,
+        default=0.1,
+        help="Weight applied to the denominator classification loss.",
+    )
+    parser.add_argument(
+        "--meter-loss-weight",
+        type=float,
+        default=0.1,
+        help="Weight applied to the combined meter classification loss.",
+    )
+    parser.add_argument(
+        "--freeze-backbone-epochs",
+        type=int,
+        default=0,
+        help="Freeze the pretrained frontend and transformer blocks for the first N epochs.",
+    )
+    parser.add_argument(
+        "--beat-pos-weight",
+        type=float,
+        default=None,
+        help="Override the automatically computed positive weight for beat loss.",
+    )
+    parser.add_argument(
+        "--downbeat-pos-weight",
+        type=float,
+        default=None,
+        help="Override the automatically computed positive weight for downbeat loss.",
     )
 
     args = parser.parse_args()

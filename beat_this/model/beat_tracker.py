@@ -46,6 +46,9 @@ class BeatThis(nn.Module):
         dropout: dict = {"frontend": 0.1, "transformer": 0.2},
         sum_head: bool = True,
         partial_transformers: bool = True,
+        num_classes: int = None,
+        den_classes: int = None,
+        meter_classes: int = None,
     ):
         super().__init__()
         # shared rotary embedding for frontend blocks and transformer blocks
@@ -98,9 +101,19 @@ class BeatThis(nn.Module):
 
         # create the output heads
         if sum_head:
-            self.task_heads = SumHead(transformer_dim)
+            self.task_heads = SumHead(
+                transformer_dim, 
+                num_classes=num_classes, 
+                den_classes=den_classes, 
+                meter_classes=meter_classes
+            )
         else:
-            self.task_heads = Head(transformer_dim)
+            self.task_heads = Head(
+                transformer_dim, 
+                num_classes=num_classes, 
+                den_classes=den_classes, 
+                meter_classes=meter_classes
+            )
 
         # init all weights
         self.apply(self._init_weights)
@@ -308,9 +321,21 @@ class SumHead(nn.Module):
     of downbeats which are not beats.
     """
 
-    def __init__(self, input_dim):
+    def __init__(self, input_dim, num_classes=None, den_classes=None, meter_classes=None):
         super().__init__()
         self.beat_downbeat_lin = nn.Linear(input_dim, 2)
+        
+        self.num_classes = num_classes
+        if num_classes is not None:
+            self.num_lin = nn.Linear(input_dim, num_classes)
+            
+        self.den_classes = den_classes
+        if den_classes is not None:
+            self.den_lin = nn.Linear(input_dim, den_classes)
+            
+        self.meter_classes = meter_classes
+        if meter_classes is not None:
+            self.meter_lin = nn.Linear(input_dim, meter_classes)
 
     def forward(self, x):
         beat_downbeat = self.beat_downbeat_lin(x)
@@ -325,7 +350,17 @@ class SumHead(nn.Module):
             disable_autocast = torch.autocast(beat.device.type, enabled=False)
         with disable_autocast:
             beat = beat.float() + downbeat.float()
-        return {"beat": beat, "downbeat": downbeat}
+            
+        out = {"beat": beat, "downbeat": downbeat}
+        
+        if self.num_classes is not None:
+            out["num"] = rearrange(self.num_lin(x), "b t c -> b c t")
+        if self.den_classes is not None:
+            out["den"] = rearrange(self.den_lin(x), "b t c -> b c t")
+        if self.meter_classes is not None:
+            out["meter"] = rearrange(self.meter_lin(x), "b t c -> b c t")
+            
+        return out
 
 
 class Head(nn.Module):
@@ -333,12 +368,34 @@ class Head(nn.Module):
     A PyToch module that produces the final beat and downbeat prediction logits with independent linear layers outputs.
     """
 
-    def __init__(self, input_dim):
+    def __init__(self, input_dim, num_classes=None, den_classes=None, meter_classes=None):
         super().__init__()
         self.beat_downbeat_lin = nn.Linear(input_dim, 2)
+        
+        self.num_classes = num_classes
+        if num_classes is not None:
+            self.num_lin = nn.Linear(input_dim, num_classes)
+            
+        self.den_classes = den_classes
+        if den_classes is not None:
+            self.den_lin = nn.Linear(input_dim, den_classes)
+            
+        self.meter_classes = meter_classes
+        if meter_classes is not None:
+            self.meter_lin = nn.Linear(input_dim, meter_classes)
 
     def forward(self, x):
         beat_downbeat = self.beat_downbeat_lin(x)
         # separate beat from downbeat
         beat, downbeat = rearrange(beat_downbeat, "b t c -> c b t", c=2)
-        return {"beat": beat, "downbeat": downbeat}
+        
+        out = {"beat": beat, "downbeat": downbeat}
+        
+        if self.num_classes is not None:
+            out["num"] = rearrange(self.num_lin(x), "b t c -> b c t")
+        if self.den_classes is not None:
+            out["den"] = rearrange(self.den_lin(x), "b t c -> b c t")
+        if self.meter_classes is not None:
+            out["meter"] = rearrange(self.meter_lin(x), "b t c -> b c t")
+            
+        return out

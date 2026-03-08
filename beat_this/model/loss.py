@@ -3,7 +3,66 @@ Loss definitions for the Beat This! beat tracker.
 """
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from typing import Dict, Union, List, Optional, Tuple
+
+class BalancedSoftmaxLoss(nn.Module):
+    def __init__(
+        self,
+        class_counts: Union[List[int], torch.Tensor],
+        tau: float = 1.0,
+        ignore_index: int = -100,
+    ):
+        """
+        Args:
+            class_counts (Union[List[int], torch.Tensor]):
+                各クラスの出現回数のリストまたはテンソル。
+                事前に Laplace 平滑化（全カウントに+1するなど）を推奨します。
+            tau (float, optional): 補正のスケール係数. Defaults to 1.0.
+        """
+        super().__init__()
+
+        class_counts = torch.tensor(class_counts, dtype=torch.float32)
+
+        # log_prior を計算し、バッファとして登録
+        # カウントが0のクラスは-infになるのを防ぐため、非常に小さい値にクリップ
+        log_prior = torch.log(torch.clamp(class_counts, min=1e-9))
+
+        self.register_buffer("log_prior", log_prior)
+        self.tau = tau
+        self.ignore_index = ignore_index
+
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            logits (torch.Tensor): モデルの出力ロジット (B, T, C)
+            labels (torch.Tensor): 正解ラベル (B, T, 1)
+
+        Returns:
+            torch.Tensor: 計算された損失値 (スカラー)
+        """
+        # Accept both channel-last (B, T, C) and channel-first (B, C, T) logits.
+        if logits.dim() > 2:
+            num_classes = self.log_prior.numel()
+            if logits.size(-1) == num_classes:
+                pass
+            elif logits.size(1) == num_classes:
+                logits = logits.movedim(1, -1)
+            else:
+                raise ValueError(
+                    f"Could not infer class dimension for logits with shape {tuple(logits.shape)}"
+                )
+            logits = logits.reshape(-1, logits.size(-1))
+            labels = labels.reshape(-1)
+
+        # ロジット補正: z_k <- z_k + τ * log(n_k)
+        adjusted_logits = logits + self.tau * self.log_prior
+
+        loss = F.cross_entropy(
+            adjusted_logits, labels, ignore_index=self.ignore_index
+        )
+        return loss
 
 
 class MaskedBCELoss(torch.nn.Module):

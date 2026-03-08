@@ -14,8 +14,8 @@ try:
 except ImportError:
     tqdm = None
 
-from beat_this.inference import File2File, load_audio
-from beat_this.utils import save_beat_tsv
+from beat_this.inference import File2Beats, load_audio
+from beat_this.utils import save_beat_tsv, save_events_tsv, save_meter_json
 
 
 def get_parser():
@@ -85,6 +85,22 @@ def get_parser():
         action="store_true",
         help="If given, saves the raw activations with a .npy suffix.",
     )
+    parser.add_argument(
+        "--downbeats-only",
+        action="store_true",
+        help="If given, save only downbeat timestamps instead of .beats output.",
+    )
+    parser.add_argument(
+        "--meter-json",
+        action="store_true",
+        help="If given, save decoded meter predictions as a .meter.json sidecar.",
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default="data",
+        help="Data directory used to reconstruct meter vocabularies for labeled output (default: %(default)s).",
+    )
     return parser
 
 
@@ -122,6 +138,9 @@ def run(
     gpu,
     float16,
     activations,
+    downbeats_only,
+    meter_json,
+    data_dir,
 ):
     # determine device
     if torch.cuda.is_available() and gpu >= 0:
@@ -129,23 +148,52 @@ def run(
     else:
         device = torch.device("cpu")
 
+    if downbeats_only and suffix == ".beats":
+        suffix = ".downbeats"
+
     # prepare model
-    file2file = File2File(model, device, float16, dbn)
+    predictor = File2Beats(model, device, float16, dbn, data_dir=data_dir)
+    if meter_json and not predictor.has_meter_predictions:
+        raise ValueError("Selected checkpoint does not provide meter predictions.")
+
+    def meter_output_path(outfile: Path) -> Path:
+        return outfile.with_suffix(".meter.json")
+
+    def write_prediction(prediction: dict, outfile: Path):
+        if downbeats_only:
+            save_events_tsv(prediction["downbeats"], outfile)
+        else:
+            save_beat_tsv(prediction["beats"], prediction["downbeats"], outfile)
+        if meter_json:
+            if prediction["meter"] is None:
+                raise ValueError("Selected checkpoint does not provide meter predictions.")
+            save_meter_json(prediction["meter"], meter_output_path(outfile))
+
+    def save_prediction(audiofile: Path, outfile: Path):
+        write_prediction(predictor.predict_file(audiofile), outfile)
+
     if activations:
 
         def process(audiofile, outfile):
             wav, sr = load_audio(audiofile)
-            spect = file2file.signal2spect(wav, sr)
-            beat_logits, downbeat_logits = file2file.spect2frames(spect)
+            spect = predictor.signal2spect(wav, sr)
+            model_prediction = predictor.spect2predictions(spect)
+            beat_logits = model_prediction["beat"]
+            downbeat_logits = model_prediction["downbeat"]
             np.save(
                 outfile.with_suffix(".npy"),
                 np.vstack([beat_logits.cpu().numpy(), downbeat_logits.cpu().numpy()]),
             )
-            beats, downbeats = file2file.frames2beats(beat_logits, downbeat_logits)
-            save_beat_tsv(beats, downbeats, outfile)
+            beats, downbeats = predictor.frames2beats(beat_logits, downbeat_logits)
+            prediction = {
+                "beats": beats,
+                "downbeats": downbeats,
+                "meter": predictor.frames2meter(model_prediction),
+            }
+            write_prediction(prediction, outfile)
 
     else:
-        process = file2file
+        process = save_prediction
 
     # process inputs
     inputs = [Path(item) for item in inputs]

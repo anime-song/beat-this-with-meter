@@ -9,3 +9,7 @@ wandb/
 .vscode/
 beat_this.egg-info/
 build/
+venv/
+.venv-wsl
+.venv-prep
+tests/

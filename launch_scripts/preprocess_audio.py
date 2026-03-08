@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 from beat_this.dataset.augment import precomputed_augmentation_filenames
 from beat_this.preprocessing import LogMelSpect, load_audio
+from beat_this.utils import resolve_annotation_paths
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
@@ -75,13 +76,13 @@ class SpectCreation:
         self.logspect_class = LogMelSpect(audio_sr, **mel_args)
         # define the augmentations
         self.augmentations = {}
-        if pitch_shift is not None:
-            self.augmentations["pitch"] = {"min": pitch_shift[0], "max": pitch_shift[1]}
-        if time_stretch is not None:
+        if pitch_shift is not None and pitch_shift[0] != 0:
+            self.augmentations["pitch"] = {"min": pitch_shift[0], "max": pitch_shift[-1] if len(pitch_shift) > 1 else pitch_shift[0]}
+        if time_stretch is not None and time_stretch[0] != 0:
             self.augmentations["tempo"] = {
                 "min": -time_stretch[0],
                 "max": time_stretch[0],
-                "stride": time_stretch[1],
+                "stride": time_stretch[1] if len(time_stretch) > 1 else 1,
             }
         # compute the names to consider according to the augmentations
         self.filenames = precomputed_augmentation_filenames(self.augmentations, "wav")
@@ -97,10 +98,6 @@ class SpectCreation:
                         executor.submit(
                             self.create_spect_piece,
                             piece_dir,
-                            Path(dataset_dir.name)
-                            / "annotations"
-                            / "beats"
-                            / f"{piece_dir.name}.beats",
                             dataset_dir.name,
                         )
                     )
@@ -111,7 +108,7 @@ class SpectCreation:
                     processed += 1
         print(f"Created {processed} spectrograms in {self.spectrograms_dir}")
 
-    def create_spect_piece(self, preprocessed_audio_folder, beat_path, dataset_name):
+    def create_spect_piece(self, preprocessed_audio_folder, dataset_name):
         """
         Create spectrogram for a single audio piece.
 
@@ -127,12 +124,19 @@ class SpectCreation:
         Returns:
             metadata (list): A list containing the metadata of the created spectrogram.
         """
+        annotation_base = self.annotations_dir / dataset_name / "annotations" / "beats"
+        txt_path, json_path = resolve_annotation_paths(
+            annotation_base, preprocessed_audio_folder.name
+        )
+        if txt_path is None and json_path is None:
+            print(
+                "beat annotation not found for",
+                preprocessed_audio_folder,
+                "under",
+                annotation_base,
+            )
+            return
         for filename in self.filenames:
-            if not (self.annotations_dir / beat_path).exists():
-                print(
-                    f"beat annotation {beat_path} not found for {preprocessed_audio_folder}"
-                )
-                return
             audio_path = preprocessed_audio_folder / filename
             spect_path = (
                 self.spectrograms_dir
@@ -202,13 +206,25 @@ class AudioPreprocessing(object):
         self.aug_sr = aug_sr
         self.ext = ext
         self.pitch_shift = pitch_shift
+        self.time_stretch_config = None
         if time_stretch:
-            # interpret tuple as (maximum percentage, stride)
-            time_stretch = range(
-                -time_stretch[0],
-                time_stretch[0] + 1,
-                time_stretch[1] if len(time_stretch) > 1 else 1,
-            )
+            stride = time_stretch[1] if len(time_stretch) > 1 else 1
+            if stride == 0 or time_stretch[0] == 0:
+                time_stretch = [0]
+            else:
+                self.time_stretch_config = {
+                    "min": -time_stretch[0],
+                    "max": time_stretch[0],
+                    "stride": stride,
+                }
+                # interpret tuple as (maximum percentage, stride)
+                time_stretch = range(
+                    -time_stretch[0],
+                    time_stretch[0] + 1,
+                    stride,
+                )
+        else:
+            time_stretch = [0]
         self.time_stretch = time_stretch
         self.verbose = verbose
 
@@ -234,13 +250,12 @@ class AudioPreprocessing(object):
         print("Processed", processed, "audio files")
 
     def process_audio_file(self, dataset_name, audio_path):
-        annotation_dir = Path(self.annotation_dir, dataset_name, "annotations")
-        # load annotations
-        beat_path = Path(annotation_dir, "beats", audio_path.stem + ".beats")
-        if not beat_path.exists():
-            print(
-                f"beat annotation {beat_path} not found for {audio_path}",
-            )
+        # the dataset_name here is "meter_dataset" from audio_paths.csv
+        annotation_dir = Path(self.annotation_dir, dataset_name, "annotations", "beats")
+        txt_path, json_path = resolve_annotation_paths(annotation_dir, audio_path.stem)
+        if txt_path is None and json_path is None:
+            print(f"Annotation not found for {audio_path.name}")
+            print(f" Searched in: {annotation_dir}")
             return False
         # create a folder with the name of the track
         folder_path = Path(self.audio_dir, "mono_tracks", dataset_name, audio_path.stem)
@@ -249,12 +264,9 @@ class AudioPreprocessing(object):
         # derive the name of all augmented files
         augmentations = {
             "pitch": {"min": self.pitch_shift[0], "max": self.pitch_shift[1]},
-            "tempo": {
-                "min": -self.time_stretch[0],
-                "max": self.time_stretch[0],
-                "stride": self.time_stretch[1],
-            },
         }
+        if self.time_stretch_config is not None:
+            augmentations["tempo"] = self.time_stretch_config
         augmentations_path = precomputed_augmentation_filenames(augmentations, self.ext)
         # stop here if all files exists
         if mono_path.exists() and all(
@@ -386,11 +398,20 @@ def create_npz(spect_dir, npz_file, augmentations, verbose):
         if verbose:
             print(f"{npz_file} already exists, skipping")
         return
-    with ZipFile(npz_file, "w") as z:
-        for subdir in tqdm(sorted(spect_dir.iterdir()), leave=False):
-            if subdir.is_dir():
-                for fn in precomputed_augmentation_filenames(augmentations):
-                    z.write(subdir / fn, subdir.name + "/" + fn)
+    try:
+        with ZipFile(npz_file, "w") as z:
+            for subdir in tqdm(sorted(spect_dir.iterdir()), leave=False):
+                if subdir.is_dir():
+                    for fn in precomputed_augmentation_filenames(augmentations):
+                        z.write(subdir / fn, subdir.name + "/" + fn)
+    except FileNotFoundError:
+        # Some filesystems do not allow creating `dataset.npz` next to a
+        # directory named `dataset`. The training code can fall back to the
+        # directory of `.npy` files, so warn and continue instead of aborting.
+        print(
+            f"Skipping {npz_file}: could not create the bundle on this filesystem. "
+            "Directory-based spectrogram loading will be used instead."
+        )
 
 
 def ints(value):

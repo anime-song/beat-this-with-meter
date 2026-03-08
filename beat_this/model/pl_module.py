@@ -39,12 +39,35 @@ class PLBeatThis(LightningModule):
         eval_trim_beats=5,
         sum_head=True,
         partial_transformers=True,
+        train_beats=True,
+        num_classes=None,
+        num_class_counts=None,
+        den_classes=None,
+        den_class_counts=None,
+        meter_classes=None,
+        meter_class_counts=None,
+        num_vocab=None,
+        den_vocab=None,
+        meter_vocab=None,
+        loss_weights=None,
+        freeze_backbone_epochs=0,
     ):
         super().__init__()
         self.save_hyperparameters()
         self.lr = lr
         self.weight_decay = weight_decay
         self.fps = fps
+        self.train_beats = train_beats
+        self.freeze_backbone_epochs = freeze_backbone_epochs
+        self._backbone_frozen = None
+        default_loss_weights = {
+            "beat": 1.0,
+            "downbeat": 1.0,
+            "num": 1.0,
+            "den": 1.0,
+            "meter": 1.0,
+        }
+        self.loss_weights = default_loss_weights | (loss_weights or {})
         # create model
         self.model = BeatThis(
             spect_dim=spect_dim,
@@ -56,6 +79,9 @@ class PLBeatThis(LightningModule):
             dropout=dropout,
             sum_head=sum_head,
             partial_transformers=partial_transformers,
+            num_classes=num_classes,
+            den_classes=den_classes,
+            meter_classes=meter_classes,
         )
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
@@ -89,48 +115,150 @@ class PLBeatThis(LightningModule):
             raise ValueError(
                 "loss_type must be one of 'shift_tolerant_weighted_bce', 'weighted_bce', 'bce'"
             )
+        if not self.train_beats:
+            self.beat_loss = None
+
+        if num_classes:
+            if num_class_counts is not None:
+                self.num_loss = beat_this.model.loss.BalancedSoftmaxLoss(
+                    class_counts=num_class_counts, tau=0.5, ignore_index=-1
+                )
+            else:
+                self.num_loss = torch.nn.CrossEntropyLoss(ignore_index=-1)
+        else:
+            self.num_loss = None
+
+        if den_classes:
+            if den_class_counts is not None:
+                self.den_loss = beat_this.model.loss.BalancedSoftmaxLoss(
+                    class_counts=den_class_counts, tau=0.5, ignore_index=-1
+                )
+            else:
+                self.den_loss = torch.nn.CrossEntropyLoss(ignore_index=-1)
+        else:
+            self.den_loss = None
+
+        if meter_classes:
+            if meter_class_counts is not None:
+                self.meter_loss = beat_this.model.loss.BalancedSoftmaxLoss(
+                    class_counts=meter_class_counts, tau=0.5, ignore_index=-1
+                )
+            else:
+                self.meter_loss = torch.nn.CrossEntropyLoss(ignore_index=-1)
+        else:
+            self.meter_loss = None
 
         self.postprocessor = Postprocessor(
-            type="dbn" if use_dbn else "minimal", fps=fps
+            type="dbn" if use_dbn else "minimal",
+            fps=fps,
+            use_beat_guidance=self.train_beats,
         )
         self.eval_trim_beats = eval_trim_beats
         self.metrics = Metrics(eval_trim_beats=eval_trim_beats)
 
     def _compute_loss(self, batch, model_prediction):
-        beat_mask = batch["padding_mask"]
-        beat_loss = self.beat_loss(
-            model_prediction["beat"], batch["truth_beat"].float(), beat_mask
-        )
+        losses = {}
+        total_loss = model_prediction["downbeat"].new_tensor(0.0)
+
+        if self.beat_loss is not None:
+            beat_mask = batch["padding_mask"].clone()
+
+            # Disable beat loss if the track only has downbeat annotations
+            if "has_only_downbeats" in batch:
+                only_downbeats = batch["has_only_downbeats"]
+                beat_mask[only_downbeats] = False
+
+            beat_loss = self.beat_loss(
+                model_prediction["beat"], batch["truth_beat"].float(), beat_mask
+            )
+            losses["beat"] = beat_loss
+            total_loss += self.loss_weights["beat"] * beat_loss
+
         # downbeat mask considers padding and also pieces which don't have downbeat annotations
-        downbeat_mask = beat_mask * batch["downbeat_mask"][:, None]
+        downbeat_mask = batch["padding_mask"] * batch["downbeat_mask"][:, None]
         downbeat_loss = self.downbeat_loss(
             model_prediction["downbeat"], batch["truth_downbeat"].float(), downbeat_mask
         )
-        # sum the losses and return them in a dictionary for logging
-        return {
-            "beat": beat_loss,
-            "downbeat": downbeat_loss,
-            "total": beat_loss + downbeat_loss,
-        }
+
+        losses["downbeat"] = downbeat_loss
+        total_loss += self.loss_weights["downbeat"] * downbeat_loss
+
+        # Meter predictions
+        if (
+            self.num_loss is not None
+            and "num" in model_prediction
+            and "time_sig_num" in batch
+        ):
+            loss_num = self.num_loss(
+                model_prediction["num"], batch["time_sig_num"].long()
+            )
+            losses["num"] = loss_num
+            total_loss += self.loss_weights["num"] * loss_num
+
+        if (
+            self.den_loss is not None
+            and "den" in model_prediction
+            and "time_sig_den" in batch
+        ):
+            loss_den = self.den_loss(
+                model_prediction["den"], batch["time_sig_den"].long()
+            )
+            losses["den"] = loss_den
+            total_loss += self.loss_weights["den"] * loss_den
+
+        if (
+            self.meter_loss is not None
+            and "meter" in model_prediction
+            and "time_sig_meter" in batch
+        ):
+            loss_meter = self.meter_loss(
+                model_prediction["meter"], batch["time_sig_meter"].long()
+            )
+            losses["meter"] = loss_meter
+            total_loss += self.loss_weights["meter"] * loss_meter
+
+        losses["total"] = total_loss
+        # return them in a dictionary for logging
+        return losses
+
+    def _compute_classification_metrics(self, batch, model_prediction):
+        metrics = {}
+        for pred_key, target_key in (
+            ("num", "time_sig_num"),
+            ("den", "time_sig_den"),
+            ("meter", "time_sig_meter"),
+        ):
+            if pred_key not in model_prediction or target_key not in batch:
+                continue
+            targets = batch[target_key].long()
+            valid = targets != -1
+            if not torch.any(valid):
+                continue
+            preds = torch.argmax(model_prediction[pred_key].float(), dim=1)
+            metrics[f"accuracy_{pred_key}"] = (
+                (preds[valid] == targets[valid]).float().mean().item()
+            )
+        return metrics
 
     def _compute_metrics(self, batch, postp_beat, postp_downbeat, step="val"):
         """ """
-        # compute for beat
-        metrics_beat = self._compute_metrics_target(
-            batch, postp_beat, target="beat", step=step
-        )
+        metrics = {}
+        if self.train_beats:
+            metrics.update(
+                self._compute_metrics_target(
+                    batch, postp_beat, target="beat", step=step
+                )
+            )
         # compute for downbeat
-        metrics_downbeat = self._compute_metrics_target(
-            batch, postp_downbeat, target="downbeat", step=step
+        metrics.update(
+            self._compute_metrics_target(
+                batch, postp_downbeat, target="downbeat", step=step
+            )
         )
-
-        # concatenate dictionaries
-        metrics = {**metrics_beat, **metrics_downbeat}
 
         return metrics
 
     def _compute_metrics_target(self, batch, postp_target, target, step):
-
         def compute_item(pospt_pred, truth_orig_target):
             # take the ground truth from the original version, so there are no quantization errors
             piece_truth_time = np.frombuffer(truth_orig_target)
@@ -163,7 +291,9 @@ class PLBeatThis(LightningModule):
 
     def log_losses(self, losses, batch_size, step="train"):
         # log for separate targets
-        for target in "beat", "downbeat":
+        for target in ("beat", "downbeat", "num", "den", "meter"):
+            if target not in losses:
+                continue
             self.log(
                 f"{step}_loss_{target}",
                 losses[target].item(),
@@ -217,6 +347,7 @@ class PLBeatThis(LightningModule):
         )
         # compute the metrics
         metrics = self._compute_metrics(batch, postp_beat, postp_downbeat, step="val")
+        metrics.update(self._compute_classification_metrics(batch, model_prediction))
         # log
         self.log_losses(losses, len(batch["spect"]), "val")
         self.log_metrics(metrics, batch["spect"].shape[0], "val")
@@ -224,6 +355,7 @@ class PLBeatThis(LightningModule):
     def test_step(self, batch, batch_idx):
         metrics, model_prediction, _, _ = self.predict_step(batch, batch_idx)
         losses = self._compute_loss(batch, model_prediction)
+        metrics.update(self._compute_classification_metrics(batch, model_prediction))
         # log
         self.log_losses(losses, len(batch["spect"]), "test")
         self.log_metrics(metrics, batch["spect"].shape[0], "test")
@@ -255,12 +387,11 @@ class PLBeatThis(LightningModule):
                 "When predicting full pieces, the Dataset must not pad inputs"
             )
         # compute border size according to the loss type
-        if hasattr(
-            self.beat_loss, "tolerance"
-        ):  # discard the edges that are affected by the max-pooling in the loss
-            border_size = 2 * self.beat_loss.tolerance
-        else:
-            border_size = 0
+        border_size = 0
+        for loss in (self.downbeat_loss, self.beat_loss):
+            if hasattr(loss, "tolerance"):
+                border_size = 2 * loss.tolerance
+                break
         model_prediction = split_predict_aggregate(
             batch["spect"][0], chunk_size, border_size, overlap_mode, self.model
         )
@@ -304,6 +435,33 @@ class PLBeatThis(LightningModule):
         result = dict(optimizer=optimizer)
         result["lr_scheduler"] = {"scheduler": self.lr_scheduler, "interval": "step"}
         return result
+
+    def _set_backbone_trainable(self, trainable: bool):
+        for module in (self.model.frontend, self.model.transformer_blocks):
+            for param in module.parameters():
+                param.requires_grad = trainable
+
+    def _update_backbone_freeze_state(self):
+        should_freeze = (
+            self.freeze_backbone_epochs > 0
+            and self.current_epoch < self.freeze_backbone_epochs
+        )
+        if self._backbone_frozen == should_freeze:
+            return
+        self._set_backbone_trainable(not should_freeze)
+        self._backbone_frozen = should_freeze
+        if should_freeze:
+            self.print(
+                f"Freezing frontend and transformer blocks for the first {self.freeze_backbone_epochs} epochs."
+            )
+        elif self.freeze_backbone_epochs > 0:
+            self.print("Unfreezing frontend and transformer blocks.")
+
+    def on_fit_start(self):
+        self._update_backbone_freeze_state()
+
+    def on_train_epoch_start(self):
+        self._update_backbone_freeze_state()
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         # remove _orig_mod prefixes for compiled models
