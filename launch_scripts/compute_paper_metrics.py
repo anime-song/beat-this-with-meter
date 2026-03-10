@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import inspect
 from pathlib import Path
 
 import numpy as np
@@ -190,7 +191,12 @@ def plmodel_setup(checkpoint, eval_trim_beats, dbn, gpu):
     if dbn is not None:
         checkpoint["hyper_parameters"]["use_dbn"] = dbn
 
-    model = PLBeatThis(**checkpoint["hyper_parameters"])
+    model_hparams = {
+        key: value
+        for key, value in checkpoint["hyper_parameters"].items()
+        if key in set(inspect.signature(PLBeatThis).parameters)
+    }
+    model = PLBeatThis(**model_hparams)
     model.load_state_dict(checkpoint["state_dict"])
     # set correct device and accelerator
     if gpu >= 0:

@@ -46,11 +46,16 @@ class PLBeatThis(LightningModule):
         den_class_counts=None,
         meter_classes=None,
         meter_class_counts=None,
+        phase_classes=None,
+        phase_class_counts=None,
         num_vocab=None,
         den_vocab=None,
         meter_vocab=None,
+        phase_vocab=None,
         loss_weights=None,
         freeze_backbone_epochs=0,
+        phase_downbeat_coupling=0.0,
+        spec_augment=None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -66,8 +71,19 @@ class PLBeatThis(LightningModule):
             "num": 1.0,
             "den": 1.0,
             "meter": 1.0,
+            "phase": 1.0,
+            "consistency": 0.0,
         }
         self.loss_weights = default_loss_weights | (loss_weights or {})
+        self.phase_vocab = list(phase_vocab) if phase_vocab is not None else None
+        self.phase_one_idx = None
+        if phase_classes is not None:
+            if self.phase_vocab is None:
+                self.phase_one_idx = 0
+            elif 1 in self.phase_vocab:
+                self.phase_one_idx = self.phase_vocab.index(1)
+            else:
+                raise ValueError("phase_vocab must contain beat phase 1.")
         # create model
         self.model = BeatThis(
             spect_dim=spect_dim,
@@ -82,6 +98,9 @@ class PLBeatThis(LightningModule):
             num_classes=num_classes,
             den_classes=den_classes,
             meter_classes=meter_classes,
+            phase_classes=phase_classes,
+            phase_downbeat_coupling=phase_downbeat_coupling,
+            spec_augment=spec_augment,
         )
         self.warmup_steps = warmup_steps
         self.max_epochs = max_epochs
@@ -148,6 +167,16 @@ class PLBeatThis(LightningModule):
         else:
             self.meter_loss = None
 
+        if phase_classes:
+            if phase_class_counts is not None:
+                self.phase_loss = beat_this.model.loss.BalancedSoftmaxLoss(
+                    class_counts=phase_class_counts, tau=0.5, ignore_index=-1
+                )
+            else:
+                self.phase_loss = torch.nn.CrossEntropyLoss(ignore_index=-1)
+        else:
+            self.phase_loss = None
+
         self.postprocessor = Postprocessor(
             type="dbn" if use_dbn else "minimal",
             fps=fps,
@@ -155,6 +184,25 @@ class PLBeatThis(LightningModule):
         )
         self.eval_trim_beats = eval_trim_beats
         self.metrics = Metrics(eval_trim_beats=eval_trim_beats)
+
+    def _compute_phase_consistency_loss(self, batch, model_prediction):
+        if (
+            self.phase_one_idx is None
+            or "phase" not in model_prediction
+            or "beat_phase" not in batch
+        ):
+            return None
+
+        valid_mask = batch["padding_mask"] & (batch["beat_phase"] != -1)
+        if not torch.any(valid_mask):
+            return None
+
+        downbeat_prob = model_prediction["downbeat"].float().sigmoid()
+        phase_prob = torch.softmax(model_prediction["phase"].float(), dim=1)[
+            :, self.phase_one_idx, :
+        ]
+        squared_error = (downbeat_prob - phase_prob).square()
+        return squared_error.masked_select(valid_mask).mean()
 
     def _compute_loss(self, batch, model_prediction):
         losses = {}
@@ -189,33 +237,56 @@ class PLBeatThis(LightningModule):
             and "num" in model_prediction
             and "time_sig_num" in batch
         ):
-            loss_num = self.num_loss(
-                model_prediction["num"], batch["time_sig_num"].long()
-            )
-            losses["num"] = loss_num
-            total_loss += self.loss_weights["num"] * loss_num
+            targets_num = batch["time_sig_num"].long()
+            if torch.any(targets_num != -1):
+                loss_num = self.num_loss(model_prediction["num"], targets_num)
+                losses["num"] = loss_num
+                total_loss += self.loss_weights["num"] * loss_num
 
         if (
             self.den_loss is not None
             and "den" in model_prediction
             and "time_sig_den" in batch
         ):
-            loss_den = self.den_loss(
-                model_prediction["den"], batch["time_sig_den"].long()
-            )
-            losses["den"] = loss_den
-            total_loss += self.loss_weights["den"] * loss_den
+            targets_den = batch["time_sig_den"].long()
+            if torch.any(targets_den != -1):
+                loss_den = self.den_loss(model_prediction["den"], targets_den)
+                losses["den"] = loss_den
+                total_loss += self.loss_weights["den"] * loss_den
 
         if (
             self.meter_loss is not None
             and "meter" in model_prediction
             and "time_sig_meter" in batch
         ):
-            loss_meter = self.meter_loss(
-                model_prediction["meter"], batch["time_sig_meter"].long()
+            targets_meter = batch["time_sig_meter"].long()
+            if torch.any(targets_meter != -1):
+                loss_meter = self.meter_loss(model_prediction["meter"], targets_meter)
+                losses["meter"] = loss_meter
+                total_loss += self.loss_weights["meter"] * loss_meter
+
+        if (
+            self.phase_loss is not None
+            and "phase" in model_prediction
+            and "beat_phase" in batch
+        ):
+            targets_phase = batch["beat_phase"].long()
+            if torch.any(targets_phase != -1):
+                loss_phase = self.phase_loss(model_prediction["phase"], targets_phase)
+                losses["phase"] = loss_phase
+                total_loss += self.loss_weights["phase"] * loss_phase
+
+        if (
+            self.loss_weights["consistency"] > 0
+        ):
+            consistency_loss = self._compute_phase_consistency_loss(
+                batch, model_prediction
             )
-            losses["meter"] = loss_meter
-            total_loss += self.loss_weights["meter"] * loss_meter
+            if consistency_loss is not None:
+                losses["consistency"] = consistency_loss
+                total_loss += (
+                    self.loss_weights["consistency"] * consistency_loss
+                )
 
         losses["total"] = total_loss
         # return them in a dictionary for logging
@@ -227,6 +298,7 @@ class PLBeatThis(LightningModule):
             ("num", "time_sig_num"),
             ("den", "time_sig_den"),
             ("meter", "time_sig_meter"),
+            ("phase", "beat_phase"),
         ):
             if pred_key not in model_prediction or target_key not in batch:
                 continue
@@ -246,19 +318,29 @@ class PLBeatThis(LightningModule):
         if self.train_beats:
             metrics.update(
                 self._compute_metrics_target(
-                    batch, postp_beat, target="beat", step=step
+                    batch,
+                    postp_beat,
+                    target="beat",
+                    step=step,
+                    metric_mask=batch.get("beat_metric_mask"),
                 )
             )
         # compute for downbeat
         metrics.update(
             self._compute_metrics_target(
-                batch, postp_downbeat, target="downbeat", step=step
+                batch,
+                postp_downbeat,
+                target="downbeat",
+                step=step,
+                metric_mask=batch.get("downbeat_mask"),
             )
         )
 
         return metrics
 
-    def _compute_metrics_target(self, batch, postp_target, target, step):
+    def _compute_metrics_target(
+        self, batch, postp_target, target, step, metric_mask=None
+    ):
         def compute_item(pospt_pred, truth_orig_target):
             # take the ground truth from the original version, so there are no quantization errors
             piece_truth_time = np.frombuffer(truth_orig_target)
@@ -272,12 +354,27 @@ class PLBeatThis(LightningModule):
         if not isinstance(postp_target, tuple):
             postp_target = (postp_target,)
 
+        truth_targets = batch[f"truth_orig_{target}"]
+        if metric_mask is not None:
+            if isinstance(metric_mask, torch.Tensor):
+                metric_mask = metric_mask.detach().cpu().bool().tolist()
+            else:
+                metric_mask = [bool(mask) for mask in metric_mask]
+            filtered_items = [
+                (pred, truth)
+                for pred, truth, keep in zip(postp_target, truth_targets, metric_mask)
+                if keep
+            ]
+            if not filtered_items:
+                return {}
+            postp_target, truth_targets = zip(*filtered_items)
+
         with ThreadPoolExecutor() as executor:
             piecewise_metrics = list(
                 executor.map(
                     compute_item,
                     postp_target,
-                    batch[f"truth_orig_{target}"],
+                    truth_targets,
                 )
             )
 
@@ -291,7 +388,15 @@ class PLBeatThis(LightningModule):
 
     def log_losses(self, losses, batch_size, step="train"):
         # log for separate targets
-        for target in ("beat", "downbeat", "num", "den", "meter"):
+        for target in (
+            "beat",
+            "downbeat",
+            "num",
+            "den",
+            "meter",
+            "phase",
+            "consistency",
+        ):
             if target not in losses:
                 continue
             self.log(

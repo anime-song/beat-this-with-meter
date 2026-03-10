@@ -65,6 +65,8 @@ def stretch_annotations(item, percentage):
     factor = 1.0 + percentage / 100
     item = dict(item)
     item["beat_time"] = item["beat_time"] / factor
+    if "downbeat_time" in item:
+        item["downbeat_time"] = item["downbeat_time"] / factor
     return item
 
 

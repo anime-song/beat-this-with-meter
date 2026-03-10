@@ -1,4 +1,5 @@
 import argparse
+import gc
 from pathlib import Path
 
 import torch
@@ -12,6 +13,14 @@ from beat_this.model.pl_module import PLBeatThis
 from beat_this.utils import replace_state_dict_key, resolve_annotation_paths
 
 
+def clear_gpu_cache():
+    if not torch.cuda.is_available():
+        return
+    gc.collect()
+    torch.cuda.empty_cache()
+    print("Cleared CUDA memory cache before training.")
+
+
 def main(args):
     # for repeatability
     seed_everything(args.seed, workers=True)
@@ -19,7 +28,7 @@ def main(args):
     print("Starting a new run with the following parameters:")
     print(args)
 
-    params_str = f"{'noval ' if not args.val else ''}{'hung ' if args.hung_data else ''}{'fold' + str(args.fold) + ' ' if args.fold is not None else ''}{args.loss}-h{args.transformer_dim}-aug{args.tempo_augmentation}{args.pitch_augmentation}{args.mask_augmentation}{' nosumH ' if not args.sum_head else ''}{' nopartialT ' if not args.partial_transformers else ''}{' downbeatOnly ' if args.downbeat_only else ''}"
+    params_str = f"{'noval ' if not args.val else ''}{'hung ' if args.hung_data else ''}{'fold' + str(args.fold) + ' ' if args.fold is not None else ''}{args.loss}-h{args.transformer_dim}-aug{args.tempo_augmentation}{args.pitch_augmentation}{args.mask_augmentation}{' specAug ' if args.spec_augment else ''}{' phaseAux ' if args.phase_prediction else ''}{' cons ' if args.phase_prediction and args.consistency_loss_weight > 0 else ''}{f' p2db{args.phase_downbeat_coupling:g} ' if args.phase_prediction and args.phase_downbeat_coupling > 0 else ''}{' pseudoBeat ' if args.pseudo_beats_from_meter else ''}{' nosumH ' if not args.sum_head else ''}{' nopartialT ' if not args.partial_transformers else ''}{' downbeatOnly ' if args.downbeat_only else ''}"
     if args.logger == "wandb":
         if args.resume_checkpoint and args.resume_id:
             wandb_args = dict(id=args.resume_id, resume="must")
@@ -57,6 +66,15 @@ def main(args):
             "min_parts": 5,
             "max_parts": 9,
         }
+    spec_augment = None
+    if args.spec_augment:
+        spec_augment = {
+            "freq_mask_ratio": 0.25,
+            "time_mask_ratio": 0.25,
+            "num_freq_masks": 1,
+            "num_time_masks": 1,
+            "p": 1.0,
+        }
 
     datamodule = BeatDataModule(
         data_dir,
@@ -70,6 +88,7 @@ def main(args):
         hung_data=args.hung_data,
         no_val=not args.val,
         fold=args.fold,
+        pseudo_beats_from_meter=args.pseudo_beats_from_meter,
     )
     datamodule.setup(stage="fit")
 
@@ -80,9 +99,12 @@ def main(args):
     den_class_counts = None
     meter_classes = None
     meter_class_counts = None
+    phase_classes = None
+    phase_class_counts = None
     num_vocab = None
     den_vocab = None
     meter_vocab = None
+    phase_vocab = None
 
     if args.meter_prediction:
         import json
@@ -142,6 +164,27 @@ def main(args):
             f"Meter Vocabulary - num_classes: {num_classes}, den_classes: {den_classes}, meter_classes: {meter_classes}"
         )
 
+    if args.phase_prediction:
+        phase_counts = {}
+        print("Scanning training data for beat phase vocabulary...")
+        for item in datamodule.train_dataset.items:
+            for phase in item["beat_value"]:
+                phase = int(phase)
+                if phase <= 0:
+                    continue
+                phase_counts[phase] = phase_counts.get(phase, 0) + 1
+
+        phase_vocab = sorted(list(phase_counts.keys()))
+        phase_to_idx = {k: v for v, k in enumerate(phase_vocab)}
+        phase_classes = len(phase_vocab)
+        phase_class_counts = [phase_counts[phase] for phase in phase_vocab]
+
+        datamodule.train_dataset.phase_to_idx = phase_to_idx
+        if hasattr(datamodule, "val_dataset") and datamodule.val_dataset is not None:
+            datamodule.val_dataset.phase_to_idx = phase_to_idx
+
+        print(f"Beat Phase Vocabulary - phase_classes: {phase_classes}")
+
     # compute positive weights
     pos_weights = datamodule.get_train_positive_weights(widen_target_mask=3)
     if args.beat_pos_weight is not None:
@@ -179,15 +222,22 @@ def main(args):
         den_class_counts=den_class_counts,
         meter_classes=meter_classes,
         meter_class_counts=meter_class_counts,
+        phase_classes=phase_classes,
+        phase_class_counts=phase_class_counts,
         num_vocab=num_vocab,
         den_vocab=den_vocab,
         meter_vocab=meter_vocab,
+        phase_vocab=phase_vocab,
         loss_weights={
             "num": args.num_loss_weight,
             "den": args.den_loss_weight,
             "meter": args.meter_loss_weight,
+            "phase": args.phase_loss_weight,
+            "consistency": args.consistency_loss_weight,
         },
         freeze_backbone_epochs=args.freeze_backbone_epochs,
+        phase_downbeat_coupling=args.phase_downbeat_coupling,
+        spec_augment=spec_augment,
     )
 
     if args.pretrained_checkpoint:
@@ -210,9 +260,13 @@ def main(args):
             raise ValueError("The model is missing the part", part, "to compile")
 
     callbacks = [LearningRateMonitor(logging_interval="step")]
-    # save only the last model
+    # save the best downbeat model plus the latest checkpoint
     callbacks.append(
         ModelCheckpoint(
+            monitor="val_F-measure_downbeat",
+            mode="max",
+            save_top_k=1,
+            save_last=True,
             every_n_epochs=1,
             dirpath=str(checkpoint_dir),
             filename=f"{args.name} S{args.seed} {params_str}".strip(),
@@ -232,6 +286,7 @@ def main(args):
         check_val_every_n_epoch=args.val_frequency,
     )
 
+    clear_gpu_cache()
     trainer.fit(pl_model, datamodule, ckpt_path=args.resume_checkpoint)
     trainer.test(pl_model, datamodule)
 
@@ -338,6 +393,12 @@ if __name__ == "__main__":
         help="Use online mask aumentation",
     )
     parser.add_argument(
+        "--spec-augment",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Apply model-side SpecAugment with 25%% masking on both time and frequency axes during training.",
+    )
+    parser.add_argument(
         "--sum-head",
         default=True,
         action=argparse.BooleanOptionalAction,
@@ -404,10 +465,22 @@ if __name__ == "__main__":
         help="Enable meter (time signature) prediction heads and losses.",
     )
     parser.add_argument(
-        "--downbeat-only",
+        "--phase-prediction",
         default=True,
         action=argparse.BooleanOptionalAction,
+        help="Enable auxiliary beat phase prediction from beat indices within each bar.",
+    )
+    parser.add_argument(
+        "--downbeat-only",
+        default=False,
+        action=argparse.BooleanOptionalAction,
         help="Disable beat loss and beat metrics; train only downbeat and optional meter targets.",
+    )
+    parser.add_argument(
+        "--pseudo-beats-from-meter",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Infer per-measure beat positions from time signatures in JSON downbeat annotations.",
     )
     parser.add_argument(
         "--num-loss-weight",
@@ -428,6 +501,24 @@ if __name__ == "__main__":
         help="Weight applied to the combined meter classification loss.",
     )
     parser.add_argument(
+        "--phase-loss-weight",
+        type=float,
+        default=0.1,
+        help="Weight applied to the auxiliary beat phase classification loss.",
+    )
+    parser.add_argument(
+        "--consistency-loss-weight",
+        type=float,
+        default=0.0,
+        help="Small weight for matching p(downbeat) with p(phase==1) on beat frames.",
+    )
+    parser.add_argument(
+        "--phase-downbeat-coupling",
+        type=float,
+        default=0.05,
+        help="Small residual weight from the phase==1 logit into the downbeat logit.",
+    )
+    parser.add_argument(
         "--freeze-backbone-epochs",
         type=int,
         default=0,
@@ -436,13 +527,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--beat-pos-weight",
         type=float,
-        default=None,
+        default=5,
         help="Override the automatically computed positive weight for beat loss.",
     )
     parser.add_argument(
         "--downbeat-pos-weight",
         type=float,
-        default=None,
+        default=20,
         help="Override the automatically computed positive weight for downbeat loss.",
     )
 

@@ -12,6 +12,7 @@ from rotary_embedding_torch import RotaryEmbedding
 from torch import nn
 
 from beat_this.model import roformer
+from beat_this.model.spec_augment import SpecAugment
 from beat_this.utils import replace_state_dict_key
 
 
@@ -49,10 +50,16 @@ class BeatThis(nn.Module):
         num_classes: int = None,
         den_classes: int = None,
         meter_classes: int = None,
+        phase_classes: int = None,
+        phase_downbeat_coupling: float = 0.0,
+        spec_augment: dict | None = None,
     ):
         super().__init__()
         # shared rotary embedding for frontend blocks and transformer blocks
         rotary_embed = RotaryEmbedding(head_dim)
+        self.spec_augment = (
+            SpecAugment(**spec_augment) if spec_augment is not None else None
+        )
 
         # create the frontend
         # - stem
@@ -102,17 +109,21 @@ class BeatThis(nn.Module):
         # create the output heads
         if sum_head:
             self.task_heads = SumHead(
-                transformer_dim, 
-                num_classes=num_classes, 
-                den_classes=den_classes, 
-                meter_classes=meter_classes
+                transformer_dim,
+                num_classes=num_classes,
+                den_classes=den_classes,
+                meter_classes=meter_classes,
+                phase_classes=phase_classes,
+                phase_downbeat_coupling=phase_downbeat_coupling,
             )
         else:
             self.task_heads = Head(
-                transformer_dim, 
-                num_classes=num_classes, 
-                den_classes=den_classes, 
-                meter_classes=meter_classes
+                transformer_dim,
+                num_classes=num_classes,
+                den_classes=den_classes,
+                meter_classes=meter_classes,
+                phase_classes=phase_classes,
+                phase_downbeat_coupling=phase_downbeat_coupling,
             )
 
         # init all weights
@@ -199,6 +210,8 @@ class BeatThis(nn.Module):
                     module.weight[module.padding_idx].fill_(0)
 
     def forward(self, x):
+        if self.spec_augment is not None:
+            x, _ = self.spec_augment(x)
         x = self.frontend(x)
         x = self.transformer_blocks(x)
         x = self.task_heads(x)
@@ -321,21 +334,34 @@ class SumHead(nn.Module):
     of downbeats which are not beats.
     """
 
-    def __init__(self, input_dim, num_classes=None, den_classes=None, meter_classes=None):
+    def __init__(
+        self,
+        input_dim,
+        num_classes=None,
+        den_classes=None,
+        meter_classes=None,
+        phase_classes=None,
+        phase_downbeat_coupling: float = 0.0,
+    ):
         super().__init__()
         self.beat_downbeat_lin = nn.Linear(input_dim, 2)
-        
+
         self.num_classes = num_classes
         if num_classes is not None:
             self.num_lin = nn.Linear(input_dim, num_classes)
-            
+
         self.den_classes = den_classes
         if den_classes is not None:
             self.den_lin = nn.Linear(input_dim, den_classes)
-            
+
         self.meter_classes = meter_classes
         if meter_classes is not None:
             self.meter_lin = nn.Linear(input_dim, meter_classes)
+
+        self.phase_classes = phase_classes
+        if phase_classes is not None:
+            self.phase_lin = nn.Linear(input_dim, phase_classes)
+        self.phase_downbeat_coupling = phase_downbeat_coupling
 
     def forward(self, x):
         beat_downbeat = self.beat_downbeat_lin(x)
@@ -343,23 +369,33 @@ class SumHead(nn.Module):
         beat, downbeat = rearrange(beat_downbeat, "b t c -> c b t", c=2)
         # aggregate beats and downbeats prediction
         # autocast to float16 disabled to avoid numerical issues causing NaNs
-        if hasattr(torch.amp, 'is_autocast_available') and not torch.amp.is_autocast_available(beat.device.type):
+        if hasattr(
+            torch.amp, "is_autocast_available"
+        ) and not torch.amp.is_autocast_available(beat.device.type):
             # but do not try disabling if the device does not support autocast
             disable_autocast = contextlib.nullcontext()
         else:
             disable_autocast = torch.autocast(beat.device.type, enabled=False)
         with disable_autocast:
             beat = beat.float() + downbeat.float()
-            
+
         out = {"beat": beat, "downbeat": downbeat}
-        
+
         if self.num_classes is not None:
             out["num"] = rearrange(self.num_lin(x), "b t c -> b c t")
         if self.den_classes is not None:
             out["den"] = rearrange(self.den_lin(x), "b t c -> b c t")
         if self.meter_classes is not None:
             out["meter"] = rearrange(self.meter_lin(x), "b t c -> b c t")
-            
+        if self.phase_classes is not None:
+            out["phase"] = rearrange(self.phase_lin(x), "b t c -> b c t")
+            if self.phase_downbeat_coupling:
+                # Phase class index 0 corresponds to beat phase 1.
+                coupling = self.phase_downbeat_coupling * out["phase"][:, 0]
+                downbeat = downbeat + coupling
+                out["beat"] = beat + coupling
+                out["downbeat"] = downbeat
+
         return out
 
 
@@ -368,34 +404,52 @@ class Head(nn.Module):
     A PyToch module that produces the final beat and downbeat prediction logits with independent linear layers outputs.
     """
 
-    def __init__(self, input_dim, num_classes=None, den_classes=None, meter_classes=None):
+    def __init__(
+        self,
+        input_dim,
+        num_classes=None,
+        den_classes=None,
+        meter_classes=None,
+        phase_classes=None,
+        phase_downbeat_coupling: float = 0.0,
+    ):
         super().__init__()
         self.beat_downbeat_lin = nn.Linear(input_dim, 2)
-        
+
         self.num_classes = num_classes
         if num_classes is not None:
             self.num_lin = nn.Linear(input_dim, num_classes)
-            
+
         self.den_classes = den_classes
         if den_classes is not None:
             self.den_lin = nn.Linear(input_dim, den_classes)
-            
+
         self.meter_classes = meter_classes
         if meter_classes is not None:
             self.meter_lin = nn.Linear(input_dim, meter_classes)
+
+        self.phase_classes = phase_classes
+        if phase_classes is not None:
+            self.phase_lin = nn.Linear(input_dim, phase_classes)
+        self.phase_downbeat_coupling = phase_downbeat_coupling
 
     def forward(self, x):
         beat_downbeat = self.beat_downbeat_lin(x)
         # separate beat from downbeat
         beat, downbeat = rearrange(beat_downbeat, "b t c -> c b t", c=2)
-        
+
         out = {"beat": beat, "downbeat": downbeat}
-        
+
         if self.num_classes is not None:
             out["num"] = rearrange(self.num_lin(x), "b t c -> b c t")
         if self.den_classes is not None:
             out["den"] = rearrange(self.den_lin(x), "b t c -> b c t")
         if self.meter_classes is not None:
             out["meter"] = rearrange(self.meter_lin(x), "b t c -> b c t")
-            
+        if self.phase_classes is not None:
+            out["phase"] = rearrange(self.phase_lin(x), "b t c -> b c t")
+            if self.phase_downbeat_coupling:
+                downbeat = downbeat + self.phase_downbeat_coupling * out["phase"][:, 0]
+                out["downbeat"] = downbeat
+
         return out

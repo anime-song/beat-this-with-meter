@@ -20,6 +20,99 @@ from beat_this.utils import index_to_framewise, resolve_annotation_paths
 from .mmnpz import MemmappedNpzFile
 
 
+_BASE_NOTE_DENOMINATORS = {
+    "whole": 1,
+    "half": 2,
+    "quarter": 4,
+    "eighth": 8,
+    "8th": 8,
+    "sixteenth": 16,
+    "16th": 16,
+    "thirty_second": 32,
+    "thirty-second": 32,
+    "32nd": 32,
+}
+
+
+def _base_note_to_denominator(base_note):
+    if base_note is None:
+        return 4
+    if isinstance(base_note, (int, float)):
+        denominator = int(base_note)
+        return denominator if denominator > 0 else None
+    normalized = str(base_note).strip().lower().replace("-", "_").replace(" ", "_")
+    return _BASE_NOTE_DENOMINATORS.get(normalized)
+
+
+def tempo_to_quarter_bpm(tempo_bpm, base_note=None):
+    tempo_bpm = float(tempo_bpm or 0)
+    base_note_denominator = _base_note_to_denominator(base_note)
+    if tempo_bpm <= 0 or base_note_denominator is None or base_note_denominator <= 0:
+        return None
+    return tempo_bpm * 4.0 / base_note_denominator
+
+
+def _estimate_measure_duration(measure):
+    tempo_bpm = tempo_to_quarter_bpm(
+        measure.get("tempo_bpm", 0), measure.get("base_note")
+    )
+    numerator = int(measure.get("time_sig_num", 0) or 0)
+    denominator = int(measure.get("time_sig_den", 0) or 0)
+    if tempo_bpm is None or tempo_bpm <= 0 or numerator <= 0 or denominator <= 0:
+        return None
+    return numerator * (60.0 / tempo_bpm) * (4.0 / denominator)
+
+
+def infer_pseudo_beats_from_measures(measures):
+    beat_times = []
+    beat_values = []
+    downbeat_times = []
+    time_sig_num = []
+    time_sig_den = []
+
+    ordered_measures = sorted(measures, key=lambda measure: measure["downbeat_sec"])
+    for idx, measure in enumerate(ordered_measures):
+        downbeat = float(measure["downbeat_sec"])
+        numerator = max(int(measure["time_sig_num"]), 1)
+        denominator = max(int(measure["time_sig_den"]), 1)
+
+        if idx + 1 < len(ordered_measures):
+            measure_duration = (
+                float(ordered_measures[idx + 1]["downbeat_sec"]) - downbeat
+            )
+        else:
+            measure_duration = _estimate_measure_duration(measure)
+
+        if measure_duration is None or measure_duration <= 0:
+            measure_beat_times = np.asarray([downbeat], dtype=np.float64)
+        else:
+            beat_period = measure_duration / numerator
+            measure_beat_times = downbeat + beat_period * np.arange(
+                numerator, dtype=np.float64
+            )
+
+        beat_times.append(measure_beat_times)
+        beat_values.append(np.arange(1, len(measure_beat_times) + 1, dtype=np.int32))
+        downbeat_times.append(downbeat)
+        time_sig_num.append(numerator)
+        time_sig_den.append(denominator)
+
+    if beat_times:
+        beat_time = np.concatenate(beat_times)
+        beat_value = np.concatenate(beat_values)
+    else:
+        beat_time = np.empty(0, dtype=np.float64)
+        beat_value = np.empty(0, dtype=np.int32)
+
+    return (
+        beat_time,
+        beat_value,
+        np.asarray(downbeat_times, dtype=np.float64),
+        np.asarray(time_sig_num, dtype=np.int32),
+        np.asarray(time_sig_den, dtype=np.int32),
+    )
+
+
 class BeatTrackingDataset(Dataset):
     """
     A PyTorch Dataset for beat tracking. This dataset loads preprocessed spectrograms and beat annotations
@@ -47,6 +140,8 @@ class BeatTrackingDataset(Dataset):
         meter_to_idx=None,
         num_to_idx=None,
         den_to_idx=None,
+        phase_to_idx=None,
+        pseudo_beats_from_meter=False,
     ):
         self.spect_basepath = data_folder / "audio" / "spectrograms"
         self.annotation_basepath = data_folder / "annotations"
@@ -59,6 +154,8 @@ class BeatTrackingDataset(Dataset):
         self.meter_to_idx = meter_to_idx
         self.num_to_idx = num_to_idx
         self.den_to_idx = den_to_idx
+        self.phase_to_idx = phase_to_idx
+        self.pseudo_beats_from_meter = pseudo_beats_from_meter
         
         datasets = sorted(set(name.split("/", 1)[0] for name in item_names))
         # load dataset info
@@ -127,38 +224,48 @@ class BeatTrackingDataset(Dataset):
         time_sig_num = None
         time_sig_den = None
         beat_annotation = None
+        downbeat_time = None
+        beat_metric_mask = False
 
         if json_path is not None:
             with open(json_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             measures = data.get("measures", [])
-            
-            beat_times = []
-            nums = []
-            dens = []
-            
-            for m in measures:
-                beat_times.append(m["downbeat_sec"])
-                nums.append(m["time_sig_num"])
-                dens.append(m["time_sig_den"])
-                
-            beat_time = np.array(beat_times, dtype=float)
-            # all downbeats
-            beat_value = np.ones_like(beat_time, dtype=np.int32)
-            time_sig_num = np.array(nums, dtype=np.int32)
-            time_sig_den = np.array(dens, dtype=np.int32)
-            
-            # Since this dataset only has downbeats, we set a flag to mask out normal beats loss
-            has_only_downbeats = True
+
+            downbeat_time = np.asarray(
+                [measure["downbeat_sec"] for measure in measures], dtype=np.float64
+            )
+            time_sig_num = np.asarray(
+                [measure["time_sig_num"] for measure in measures], dtype=np.int32
+            )
+            time_sig_den = np.asarray(
+                [measure["time_sig_den"] for measure in measures], dtype=np.int32
+            )
+            if self.pseudo_beats_from_meter:
+                (
+                    beat_time,
+                    beat_value,
+                    downbeat_time,
+                    time_sig_num,
+                    time_sig_den,
+                ) = infer_pseudo_beats_from_measures(measures)
+                has_only_downbeats = False
+            else:
+                beat_time = downbeat_time
+                beat_value = np.ones_like(beat_time, dtype=np.int32)
+                has_only_downbeats = True
              
         elif txt_path is not None:
             beat_annotation = np.loadtxt(txt_path)
             if beat_annotation.ndim == 2:
                 beat_time = beat_annotation[:, 0]
                 beat_value = beat_annotation[:, 1].astype(int)
+                downbeat_time = beat_time[beat_value == 1]
+                beat_metric_mask = True
             else:
                 beat_time = beat_annotation
                 beat_value = np.zeros_like(beat_time, dtype=np.int32)
+                downbeat_time = np.empty(0, dtype=np.float64)
             has_only_downbeats = False
         else:
             print(f"Skipping {item_name} because no annotation file was found.")
@@ -182,8 +289,10 @@ class BeatTrackingDataset(Dataset):
             "spect_path": Path(item_name) / "track.npy",
             "beat_time": beat_time,
             "beat_value": beat_value,
+            "downbeat_time": downbeat_time,
             "downbeat_mask": downbeat_mask,
             "has_only_downbeats": has_only_downbeats,
+            "beat_metric_mask": beat_metric_mask,
             "time_sig_num": time_sig_num,
             "time_sig_den": time_sig_den,
             "dataset": dataset,
@@ -207,7 +316,7 @@ class BeatTrackingDataset(Dataset):
 
     def get_downbeat_count(self, index):
         """Return number of downbeats of given item."""
-        return (self.items[index]["beat_value"] == 1).sum()
+        return len(self.items[index]["downbeat_time"])
 
     def __len__(self):
         return len(self.items)
@@ -256,10 +365,16 @@ class BeatTrackingDataset(Dataset):
                 framewise_truth_downbeat,
                 truth_orig_beat,
                 truth_orig_downbeat,
+                framewise_beat_phase,
                 framewise_time_sig_num,
                 framewise_time_sig_den,
                 has_only_downbeats,
-            ) = prepare_annotations(item, start_frame, end_frame, self.fps)
+            ) = prepare_annotations(
+                item,
+                start_frame,
+                end_frame,
+                self.fps,
+            )
 
             # restructure the item dict with the correct training information
             out_item = {
@@ -278,35 +393,40 @@ class BeatTrackingDataset(Dataset):
                 "truth_orig_beat": truth_orig_beat,
                 "truth_orig_downbeat": truth_orig_downbeat,
                 "has_only_downbeats": torch.as_tensor(has_only_downbeats),
+                "beat_metric_mask": torch.as_tensor(item["beat_metric_mask"]),
             }
-            if framewise_time_sig_num is not None:
-                # convert native values to class indices if vocab dictionaries are provided
-                if self.num_to_idx is not None:
-                    mapped_num = np.zeros_like(framewise_time_sig_num) - 1
-                    for val, idx in self.num_to_idx.items():
-                        mapped_num[framewise_time_sig_num == val] = idx
-                    out_item["time_sig_num"] = mapped_num
-                else:
-                    out_item["time_sig_num"] = framewise_time_sig_num
-                    
-                if self.den_to_idx is not None:
-                    mapped_den = np.zeros_like(framewise_time_sig_den) - 1
-                    for val, idx in self.den_to_idx.items():
-                        mapped_den[framewise_time_sig_den == val] = idx
-                    out_item["time_sig_den"] = mapped_den
-                else:
-                    out_item["time_sig_den"] = framewise_time_sig_den
-                    
-                if self.meter_to_idx is not None:
-                    # Create meter sequence from num and den
-                    # we only iterate over non-ignore (-1) elements
-                    meter_seq = np.zeros_like(framewise_time_sig_num) - 1
-                    valid_mask = framewise_time_sig_num != -1
-                    for i in np.where(valid_mask)[0]:
-                        meter_str = f"{framewise_time_sig_num[i]}/{framewise_time_sig_den[i]}"
-                        if meter_str in self.meter_to_idx:
-                            meter_seq[i] = self.meter_to_idx[meter_str]
-                    out_item["time_sig_meter"] = meter_seq
+            if self.phase_to_idx is not None:
+                mapped_phase = np.zeros_like(framewise_beat_phase) - 1
+                for val, idx in self.phase_to_idx.items():
+                    mapped_phase[framewise_beat_phase == val] = idx
+                out_item["beat_phase"] = mapped_phase
+            else:
+                out_item["beat_phase"] = framewise_beat_phase
+
+            if self.num_to_idx is not None:
+                mapped_num = np.zeros_like(framewise_time_sig_num) - 1
+                for val, idx in self.num_to_idx.items():
+                    mapped_num[framewise_time_sig_num == val] = idx
+                out_item["time_sig_num"] = mapped_num
+            else:
+                out_item["time_sig_num"] = framewise_time_sig_num
+
+            if self.den_to_idx is not None:
+                mapped_den = np.zeros_like(framewise_time_sig_den) - 1
+                for val, idx in self.den_to_idx.items():
+                    mapped_den[framewise_time_sig_den == val] = idx
+                out_item["time_sig_den"] = mapped_den
+            else:
+                out_item["time_sig_den"] = framewise_time_sig_den
+
+            if self.meter_to_idx is not None:
+                meter_seq = np.zeros_like(framewise_time_sig_num) - 1
+                valid_mask = (framewise_time_sig_num != -1) & (framewise_time_sig_den != -1)
+                for i in np.where(valid_mask)[0]:
+                    meter_str = f"{framewise_time_sig_num[i]}/{framewise_time_sig_den[i]}"
+                    if meter_str in self.meter_to_idx:
+                        meter_seq[i] = self.meter_to_idx[meter_str]
+                out_item["time_sig_meter"] = meter_seq
 
             # pad all framewise tensors if needed
             if longer < 0:
@@ -316,12 +436,19 @@ class BeatTrackingDataset(Dataset):
                 for k in "truth_beat", "truth_downbeat":
                     out_item[k] = np.pad(out_item[k], [(0, -longer)], constant_values=0)
                 out_item["padding_mask"][longer:] = 0
-                if framewise_time_sig_num is not None:
-                    # use -1 as ignore label index for padding
-                    out_item["time_sig_num"] = np.pad(out_item["time_sig_num"], [(0, -longer)], constant_values=-1)
-                    out_item["time_sig_den"] = np.pad(out_item["time_sig_den"], [(0, -longer)], constant_values=-1)
-                    if self.meter_to_idx is not None:
-                        out_item["time_sig_meter"] = np.pad(out_item["time_sig_meter"], [(0, -longer)], constant_values=-1)
+                out_item["beat_phase"] = np.pad(
+                    out_item["beat_phase"], [(0, -longer)], constant_values=-1
+                )
+                out_item["time_sig_num"] = np.pad(
+                    out_item["time_sig_num"], [(0, -longer)], constant_values=-1
+                )
+                out_item["time_sig_den"] = np.pad(
+                    out_item["time_sig_den"], [(0, -longer)], constant_values=-1
+                )
+                if self.meter_to_idx is not None:
+                    out_item["time_sig_meter"] = np.pad(
+                        out_item["time_sig_meter"], [(0, -longer)], constant_values=-1
+                    )
                     
             return out_item
 
@@ -367,6 +494,7 @@ class BeatDataModule(pl.LightningDataModule):
         length_based_oversampling_factor=0,
         fold=None,
         predict_datasplit="test",
+        pseudo_beats_from_meter=False,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -386,6 +514,7 @@ class BeatDataModule(pl.LightningDataModule):
         self.length_based_oversampling_factor = length_based_oversampling_factor
         self.fold = fold
         self.predict_datasplit = predict_datasplit
+        self.pseudo_beats_from_meter = pseudo_beats_from_meter
 
     def setup(self, stage):
         if self.initialized.get(stage, False):
@@ -457,6 +586,7 @@ class BeatDataModule(pl.LightningDataModule):
                 train_length=self.train_length,
                 data_folder=self.data_dir,
                 spect_fps=self.spect_fps,
+                pseudo_beats_from_meter=self.pseudo_beats_from_meter,
             )
             print(
                 "Validation set:",
@@ -476,6 +606,7 @@ class BeatDataModule(pl.LightningDataModule):
                 data_folder=self.data_dir,
                 spect_fps=self.spect_fps,
                 length_based_oversampling_factor=self.length_based_oversampling_factor,
+                pseudo_beats_from_meter=self.pseudo_beats_from_meter,
             )
             print(
                 "Training set:",
@@ -501,6 +632,7 @@ class BeatDataModule(pl.LightningDataModule):
                 train_length=None,
                 data_folder=self.data_dir,
                 spect_fps=self.spect_fps,
+                pseudo_beats_from_meter=self.pseudo_beats_from_meter,
             )
             print(
                 "Test set:", len(self.test_dataset), "items from:", self.test_set_name
@@ -528,6 +660,7 @@ class BeatDataModule(pl.LightningDataModule):
                     train_length=None,
                     data_folder=self.data_dir,
                     spect_fps=self.spect_fps,
+                    pseudo_beats_from_meter=self.pseudo_beats_from_meter,
                 )
 
     def train_dataloader(self):
@@ -573,7 +706,7 @@ class BeatDataModule(pl.LightningDataModule):
                 all_frames_db += frames
         beat_frames = sum(len(item["beat_value"]) for item in dataset.items)
         downbeat_frames = sum(
-            (item["beat_value"] == 1).sum()
+            len(item["downbeat_time"])
             for item in dataset.items
             if item["downbeat_mask"]
         )
@@ -595,52 +728,85 @@ class BeatDataModule(pl.LightningDataModule):
 
 
 def prepare_annotations(item, start_frame, end_frame, fps):
-    truth_bdb_time = item["beat_time"]
-    truth_bdb_value = item["beat_value"]
+    truth_beat_time = item["beat_time"]
+    truth_beat_value = item["beat_value"]
+    truth_downbeat_time = item["downbeat_time"]
+    downbeat_frames_abs = (item["downbeat_time"] * fps).round().astype(int)
     # convert beat time from seconds to frame
-    truth_bdb_frame = (truth_bdb_time * fps).round().astype(int)
+    truth_beat_frame = (truth_beat_time * fps).round().astype(int)
     # form annotations excerpt
     # filter out the annotations that are earlier than the start and shift left
-    truth_bdb_frame -= start_frame
-    idx_start = np.searchsorted(truth_bdb_frame, 0)
-    truth_bdb_frame = truth_bdb_frame[idx_start:]
-    truth_bdb_value = truth_bdb_value[idx_start:]
+    truth_beat_frame -= start_frame
+    beat_idx_start = np.searchsorted(truth_beat_frame, 0)
+    truth_beat_frame = truth_beat_frame[beat_idx_start:]
+    truth_beat_value = truth_beat_value[beat_idx_start:]
     
     # filter out the annotations that are later than the end
-    idx_end = np.searchsorted(truth_bdb_frame, end_frame - start_frame)
-    truth_bdb_frame = truth_bdb_frame[:idx_end]
-    truth_bdb_value = truth_bdb_value[:idx_end]
+    beat_idx_end = np.searchsorted(truth_beat_frame, end_frame - start_frame)
+    truth_beat_frame = truth_beat_frame[:beat_idx_end]
+    truth_beat_value = truth_beat_value[:beat_idx_end]
+
+    truth_downbeat_frame = (truth_downbeat_time * fps).round().astype(int) - start_frame
+    downbeat_idx_start = np.searchsorted(truth_downbeat_frame, 0)
+    truth_downbeat_frame = truth_downbeat_frame[downbeat_idx_start:]
+    downbeat_idx_end = np.searchsorted(truth_downbeat_frame, end_frame - start_frame)
+    truth_downbeat_frame = truth_downbeat_frame[:downbeat_idx_end]
 
     # create beat and downbeat separated annotations
-    truth_beat = truth_bdb_frame
-    truth_downbeat = truth_bdb_frame[truth_bdb_value == 1]
+    truth_beat = truth_beat_frame
+    truth_downbeat = truth_downbeat_frame
     # transform beat downbeat to frame-wise annotations
     framewise_truth_beat = index_to_framewise(truth_beat, end_frame - start_frame)
     framewise_truth_downbeat = index_to_framewise(
         truth_downbeat, end_frame - start_frame
     )
-    
+
+    length = end_frame - start_frame
+    framewise_beat_phase = np.zeros(length, dtype=np.int32) - 1
+    valid_phase = truth_beat_value > 0
+    if np.any(valid_phase):
+        framewise_beat_phase[truth_beat_frame[valid_phase]] = truth_beat_value[
+            valid_phase
+        ]
+
     # prepare time_sig_num and time_sig_den if they are presented
-    framewise_time_sig_num = None
-    framewise_time_sig_den = None
-    
-    if item.get("time_sig_num") is not None and item.get("time_sig_den") is not None:
-        idx_end_sig = idx_start + idx_end # recover original offset end index
-        time_sig_num_seq = item["time_sig_num"][idx_start:idx_end_sig]
-        time_sig_den_seq = item["time_sig_den"][idx_start:idx_end_sig]
-        
-        # transform to framewise annotations (similar to beat, but set categorical labels at the downbeat frames)
-        framewise_time_sig_num = np.zeros(end_frame - start_frame, dtype=np.int32) - 1 # Use -1 as ignore index
-        framewise_time_sig_num[truth_downbeat] = time_sig_num_seq
-        
-        framewise_time_sig_den = np.zeros(end_frame - start_frame, dtype=np.int32) - 1
-        framewise_time_sig_den[truth_downbeat] = time_sig_den_seq
+    framewise_time_sig_num = np.zeros(length, dtype=np.int32) - 1
+    framewise_time_sig_den = np.zeros(length, dtype=np.int32) - 1
+    time_sig_num = item.get("time_sig_num")
+    time_sig_den = item.get("time_sig_den")
+    measure_count = len(downbeat_frames_abs)
+
+    if measure_count > 0:
+        first_measure_idx = max(
+            np.searchsorted(downbeat_frames_abs, start_frame, side="right") - 1,
+            0,
+        )
+
+        for measure_idx in range(first_measure_idx, measure_count):
+            measure_start = downbeat_frames_abs[measure_idx]
+            if measure_start >= end_frame:
+                break
+
+            if measure_idx + 1 < measure_count:
+                measure_end = downbeat_frames_abs[measure_idx + 1]
+            else:
+                measure_end = end_frame
+
+            overlap_start = max(measure_start, start_frame)
+            overlap_end = min(measure_end, end_frame)
+            if overlap_end <= overlap_start:
+                continue
+
+            rel_start = overlap_start - start_frame
+            rel_end = overlap_end - start_frame
+            if time_sig_num is not None and measure_idx < len(time_sig_num):
+                framewise_time_sig_num[rel_start:rel_end] = time_sig_num[measure_idx]
+            if time_sig_den is not None and measure_idx < len(time_sig_den):
+                framewise_time_sig_den[rel_start:rel_end] = time_sig_den[measure_idx]
 
     # create orig beat, downbeat annotations for unquantized evaluation
     truth_orig_beat = item["beat_time"]
-    truth_orig_downbeat = truth_bdb_time[
-        item["beat_value"] == 1
-    ]  # (use the full beat_value)
+    truth_orig_downbeat = truth_downbeat_time
     # filter out the annotations that are outside the excerpt, and shift them left to the excerpt time
     truth_orig_beat = truth_orig_beat[
         (truth_orig_beat >= start_frame / fps) & (truth_orig_beat < end_frame / fps)
@@ -657,6 +823,7 @@ def prepare_annotations(item, start_frame, end_frame, fps):
         framewise_truth_downbeat,
         truth_orig_beat,
         truth_orig_downbeat,
+        framewise_beat_phase,
         framewise_time_sig_num,
         framewise_time_sig_den,
         item.get("has_only_downbeats", False)
